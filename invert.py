@@ -14,7 +14,7 @@ import sys
 import numpy as np
 
 import keras_stylegan
-
+import vis
 
 def loadModel(filePrefix):
     jsonFile = filePrefix + ".json"
@@ -81,7 +81,7 @@ def save_synth_recons(generator, hourglass, latent_dim, prefix):
         save_grid(recons_imgs, r, c, prefix+"-gen-recons.png")
 
 
-def save_real_recons(generator, hourglass, inp, prefix):
+def save_real_recons(hourglass, inp, prefix):
         r, c = 5, 5
         gen_imgs = inp[:r * c]
         recons_imgs = hourglass.predict(gen_imgs)
@@ -96,7 +96,7 @@ def save_real_recons(generator, hourglass, inp, prefix):
 def build_inverter(img_shape, latent_dim):
     from keras.layers import LeakyReLU, Conv2D, AveragePooling2D
 
-    resolution = 32
+    resolution = 64
     resolution_log2 = int(np.log2(resolution))
     fmap_base = 8192
     fmap_decay = 1.0
@@ -132,20 +132,112 @@ def build_inverter(img_shape, latent_dim):
     return Model(images_in, z)
 
 
+import keras.utils
+
+class GaussianDataGenerator(keras.utils.Sequence):
+    def __init__(self, latent_dim, epoch_size, batch_size):
+        self.latent_dim = latent_dim
+        self.epoch_size = epoch_size
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return self.epoch_size // self.batch_size
+
+    def __getitem__(self, index):
+        z = np.random.normal(size=(self.batch_size, self.latent_dim))
+        return z, z # autoencoder!
+
+    def on_epoch_end(self):
+        pass
+
+from keras.callbacks import Callback
+
+class VisualizationCallback(Callback):
+    def __init__(self, generator, inverter, images):
+        self.generator = generator
+        self.inverter = inverter
+        self.images = images
+        super(VisualizationCallback, self).__init__()
+
+    def on_epoch_end(self, epoch, logs):
+        dumb_inputs = Input(shape=(64, 64, 3))
+        hourglass_output = AveragePooling2D(pool_size=(16, 16))(self.generator(self.inverter(dumb_inputs)))
+        hourglass = Model(dumb_inputs, hourglass_output)
+        vis.display_reconstructed(hourglass, self.images, "images/%03d-heldout_synth_recons_64" % (epoch+1))
+
+
+class ModelSaveCallback(Callback):
+    def __init__(self, model, name):
+        self.model = model
+        self.name = name
+
+    def on_epoch_end(self, epoch, logs):
+        if (epoch + 1) % 10 == 0:
+            saveModel(self.model, "%s-%03d" % (self.name, epoch + 1))
+
 def main():
     G, D, Gs = keras_stylegan.load_stylegan_networks()
 
     latent_dim = 512
     generator = keras_stylegan.StyleGANLayer(Gs)
-    inp = np.random.normal(size=(128, latent_dim))
     # images = generator.predict(inp)
     # save_imgs(generator, latent_dim, "model-d%d.png" % latent_dim)
 
-    print("we dumb it down to 32x32.")
-    inverter = build_inverter((32, 32, 3), latent_dim)
+    print("we dumb it down to 64x64.")
+    inverter = build_inverter((64, 64, 3), latent_dim)
     inputs = Input(shape=(512, ))
-    barrel_output = inverter(AveragePooling2D(pool_size=(32, 32))(generator(inputs)))
-    barrel = Model(inputs, barrel_output)
+    dumbed_output = AveragePooling2D(pool_size=(16, 16))(generator(inputs))
+    dumbed_generator = Model(inputs, dumbed_output)
+
+    data_from_cache = True
+    if data_from_cache:
+        print("loading data...")
+        latents = np.load("latent.npy")
+        images = np.load("generated.npy")
+        print("data loaded")
+        n = len(latents)
+    else:
+        n = 30000
+        latents = np.random.normal(size=(n, latent_dim))
+        np.save("latent.npy", latents)
+        print("creating images...")
+        images = dumbed_generator.predict(latents)
+        print("images created")
+        np.save("generated.npy", images)
+
+    inverter_from_cache = False
+    if inverter_from_cache:
+        # if we take the saves/inverter.h5 with the
+        # saved/generated.npy that it was trained on,
+        # we get very good reconstruction, see
+        # https://old.renyi.hu/~daniel/tmp/inverting-is-hard/stylegan/overfit.png
+        inverter = loadModel("inverter")
+        dumb_inputs = Input(shape=(64, 64, 3))
+        hourglass_output = dumbed_generator(inverter(dumb_inputs))
+        hourglass = Model(dumb_inputs, hourglass_output)
+        vis.display_reconstructed(hourglass, images, "overfit")
+        return
+    else:
+        generate_on_the_fly = True
+        if generate_on_the_fly:
+            print("training the inverter with data generated on-the-fly.")
+
+            latent_generator = GaussianDataGenerator(latent_dim=latent_dim, epoch_size=20000, batch_size=32)
+            vis_callback = VisualizationCallback(generator, inverter, images)
+            save_callback = ModelSaveCallback(inverter, "snapshots/inverter-snapshot")
+
+            barrel = Sequential([dumbed_generator, inverter])
+            barrel.compile(optimizer=Adam(lr=0.0001), loss='mse')
+            
+            barrel.fit_generator(generator=latent_generator, epochs=1200, callbacks=[vis_callback, save_callback])
+            saveModel(inverter, "inverter")
+            return
+        else:
+            print("training the inverter with precomputed data.")
+            inverter.compile(optimizer=Adam(lr=0.0001), loss='mse')
+            inverter.fit(images, latents, batch_size=32, shuffle=True, epochs=100)
+            saveModel(inverter, "inverter")
+            return
 
     epochs = 3
     which = "barrel"
@@ -174,7 +266,7 @@ def main():
     save_synth_recons(generator, hourglass, latent_dim, name)
     
     print("save_real_recons badly missing")
-    # save_real_recons(generator, hourglass, x_test, name)
+    # save_real_recons(hourglass, x_test, name)
 
     n = 50
     a = np.mgrid[-2:+2:(n*1j), -2:+2:(n*1j)].reshape(2,-1)
