@@ -1,7 +1,7 @@
 from __future__ import print_function, division
 
 from keras.datasets import mnist
-from keras.layers import Input, Dense, Reshape, Flatten, Dropout
+from keras.layers import Input, Dense, Reshape, Flatten, Dropout, AveragePooling2D
 from keras.layers import BatchNormalization, Activation, ZeroPadding2D
 from keras.layers.advanced_activations import LeakyReLU
 from keras.layers.convolutional import UpSampling2D, Conv2D
@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import sys
 import numpy as np
 
-from keras_stylegan import StyleGANLayer
+import keras_stylegan
 
 
 def loadModel(filePrefix):
@@ -94,77 +94,68 @@ def save_real_recons(generator, hourglass, inp, prefix):
 
 
 def build_inverter(img_shape, latent_dim):
-        model = Sequential()
+    from keras.layers import LeakyReLU, Conv2D, AveragePooling2D
 
-        # dummy
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(Flatten())
-        model.add(Dense(latent_dim, activation='linear'))
-        model.summary()
+    resolution = 32
+    resolution_log2 = int(np.log2(resolution))
+    fmap_base = 8192
+    fmap_decay = 1.0
+    fmap_max = 512
+    leak = 0.2
+    def nf(stage): return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
+    gain = np.sqrt(2)
 
-        img = Input(shape=img_shape)
-        validity = model(img)
-
-        return Model(img, validity)
+    assert resolution == img_shape[0] == img_shape[1]
+    assert latent_dim == 512
+    images_in = Input(shape=img_shape)
 
 
+    # Building blocks.
+    def fromrgb(x, res): # res = 2..resolution_log2
+        return LeakyReLU(leak)(Conv2D(filters=nf(res-1), kernel_size=1, padding="same", input_shape=img_shape)(x))
 
-        model.add(Conv2D(32, kernel_size=3, strides=2, input_shape=img_shape, padding="same"))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Conv2D(64, kernel_size=3, strides=2, padding="same"))
-        model.add(ZeroPadding2D(padding=((0,1),(0,1))))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Conv2D(128, kernel_size=3, strides=2, padding="same"))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Conv2D(256, kernel_size=3, strides=1, padding="same"))
-        model.add(BatchNormalization(momentum=0.8))
-        model.add(LeakyReLU(alpha=0.2))
-        model.add(Dropout(0.25))
-        model.add(Flatten())
-        model.add(Dense(latent_dim, activation='linear'))
-        model.summary()
+    def block(x, res): # res = 2..resolution_log2
+        if res >= 3: # 8x8 and up
+            x = LeakyReLU(leak)(Conv2D(filters=nf(res-1), kernel_size=3, padding="same")(x))
+            x = Conv2D(filters=nf(res-2), kernel_size=3, padding="same")(x)
+            x = LeakyReLU(leak)(AveragePooling2D()(x)) # blur omitted
+        else: # 4x4
+            x = LeakyReLU(leak)(Conv2D(filters=nf(res-1), kernel_size=3, padding="same")(x))
+            x = Dense(nf(res-2))(Flatten()(x))
+        return x
 
-        img = Input(shape=img_shape)
-        validity = model(img)
-
-        return Model(img, validity)
+    # Fixed structure: simple and efficient, but does not support progressive growing.
+    x = fromrgb(images_in, resolution_log2)
+    for res in range(resolution_log2, 2, -1):
+        x = block(x, res)
+    z = block(x, 2)
+    return Model(images_in, z)
 
 
 def main():
-    latent_dim = 512
-    generator = StyleGANLayer()
-    generator.trainable = False
-    generator = Sequential([generator])
-    inp = np.random.normal(size=(128, latent_dim))
-    images = generator.predict(inp)
-    save_imgs(generator, latent_dim, "model-d%d.png" % latent_dim)
-    
-    inverter = build_inverter((1024, 1024, 3), latent_dim)
-    print(">>>", inverter.predict(images).shape)
-    barrel = Sequential([generator, inverter])
-    hourglass = Sequential([inverter, generator])
-    print(barrel.predict(inp).shape)
+    G, D, Gs = keras_stylegan.load_stylegan_networks()
 
-    epochs = 10
+    latent_dim = 512
+    generator = keras_stylegan.StyleGANLayer(Gs)
+    inp = np.random.normal(size=(128, latent_dim))
+    # images = generator.predict(inp)
+    # save_imgs(generator, latent_dim, "model-d%d.png" % latent_dim)
+
+    print("we dumb it down to 32x32.")
+    inverter = build_inverter((32, 32, 3), latent_dim)
+    inputs = Input(shape=(512, ))
+    barrel_output = inverter(AveragePooling2D(pool_size=(32, 32))(generator(inputs)))
+    barrel = Model(inputs, barrel_output)
+
+    epochs = 3
     which = "barrel"
     if which == "barrel":
-        barrel.compile(optimizer=Adam(lr=0.002), loss='mse')
-        z_train = np.random.normal(size=(25600, latent_dim))
+        barrel.compile(optimizer=Adam(lr=0.0001), loss='mse')
+        z_train = np.random.normal(size=(256000, latent_dim))
         z_test  = np.random.normal(size=(  160, latent_dim))
         barrel.fit(z_train, z_train,
                 epochs=epochs,
-                batch_size=16,
+                batch_size=32,
                 shuffle=True,
                 validation_data=(z_test, z_test))
     else:

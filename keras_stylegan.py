@@ -21,8 +21,7 @@ from keras.models import Model
 import tensorflow as tf
 
 
-class StyleGANLayer(Layer):
-    def __init__(self):
+def load_stylegan_networks():
         # Initialize TensorFlow.
         tflib.init_tf()
 
@@ -33,8 +32,11 @@ class StyleGANLayer(Layer):
             # _G = Instantaneous snapshot of the generator. Mainly useful for resuming a previous training run.
             # _D = Instantaneous snapshot of the discriminator. Mainly useful for resuming a previous training run.
             # Gs = Long-term average of the generator. Yields higher-quality results than the instantaneous snapshot.
+        return _G, _D, Gs
 
-        # Print network details.
+
+class StyleGANLayer(Layer):
+    def __init__(self, Gs):
         self.network = Gs
         self.latent_dim = 512
         self.output_dim = (1024, 1024, 3)
@@ -53,14 +55,14 @@ class StyleGANLayer(Layer):
         #images = images * scale + (0.5 - drange[0] * scale)
         #return tf.saturate_cast(images, tf.uint8)
 
-
-    # Generate image.
-    # fmt = dict(func=tflib.convert_images_to_uint8, nchw_to_nhwc=True)
-    # images = Gs.run(latents, None, truncation_psi=0.7, randomize_noise=True, output_transform=fmt)
+    def compute_output_shape(self, input_shape):
+        return tuple([input_shape[0]] + list(self.output_dim))
 
 
 def main():
-    sglayer = StyleGANLayer()
+    G, D, Gs = load_stylegan_networks()
+    sglayer = StyleGANLayer(Gs)
+
     inputs =  Input(shape=(sglayer.latent_dim, ))
     outputs = sglayer(inputs)
     model = Model(inputs=inputs, outputs=outputs)
